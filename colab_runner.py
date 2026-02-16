@@ -11,12 +11,11 @@ url = os.environ.get('SB_URL')
 key = os.environ.get('SB_KEY')
 session_id = os.environ.get('SESSION_ID')
 job_id = os.environ.get('JOB_ID')
-# model_choice = os.environ.get('MODEL_VERSION', 'sam2') 
 
 print(f"🚀 SCRIPT STARTED | Job: {job_id}", flush=True)
 
 if not url or url == "undefined" or not key or key == "undefined":
-    print("❌ ERROR: Credentials missing. Check React .env file.", flush=True)
+    print("❌ ERROR: Credentials missing.", flush=True)
     exit(1)
 
 supabase = create_client(url, key)
@@ -32,20 +31,15 @@ def update_status(status, progress=0, logs=""):
     except: pass
 
 def mask_to_polygon(mask, tolerance=1.0):
-    """Converts binary mask to [x, y, x, y...] for React Konva"""
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return []
-    
     cnt = max(contours, key=cv2.contourArea)
-    epsilon = tolerance * cv2.arcLength(cnt, True) / 1000
-    approx = cv2.approxPolyDP(cnt, epsilon, True)
-    
+    approx = cv2.approxPolyDP(cnt, tolerance * cv2.arcLength(cnt, True) / 1000, True)
     return approx.flatten().tolist()
 
 try:
     update_status("running", progress=5, logs="Fetching images...")
 
-    # 2. Get Images
     response = supabase.table("images_dev").select("*").eq("job_id", job_id).execute()
     images = response.data
     
@@ -56,12 +50,15 @@ try:
     print(f"📂 Processing {len(images)} images...", flush=True)
 
     for i, img_row in enumerate(images):
-        img_uuid = img_row['id']           # Matches 'image_id' in annotations table
+        # 🔥 CRITICAL FIX: Use 'storage_path' as the ID for annotations table
+        # This matches what your React App expects (users/.../image.jpg)
+        target_image_id = img_row['storage_path'] 
+        
         storage_path = img_row['storage_path']
         project_id = img_row['project_id']
         target_user_id = img_row['user_id'] 
 
-        print(f"📸 [{i+1}/{len(images)}] {storage_path}", flush=True)
+        print(f"📸 [{i+1}/{len(images)}] {target_image_id}", flush=True)
         
         # Download Image
         img_url = f"{url}/storage/v1/object/public/datasets/{storage_path}"
@@ -73,12 +70,10 @@ try:
             print(f"⚠️ Failed to download: {storage_path}", flush=True)
             continue
 
-        # 3. GENERATE MASK (Simulation for testing visibility)
+        # 3. GENERATE MASK (Simulation)
         mask = np.zeros((h, w), dtype=np.uint8)
-        # Create a large central box so you DEFINITELY see it
         cv2.rectangle(mask, (int(w*0.25), int(h*0.25)), (int(w*0.75), int(h*0.75)), 1, -1)
         
-        # 4. Convert to Polygon
         polygon_points = mask_to_polygon(mask)
 
         new_annotations = [
@@ -96,42 +91,34 @@ try:
             }
         ]
 
-        # 5. 🔥 SMART REPAIR & MERGE 🔥
-        # This fixes the "Invisible Data" bug by forcing the ID to match the Image ID
+        # 4. FETCH EXISTING (using storage_path as key)
+        existing = supabase.table("annotations_dev").select("annotations").eq("image_id", target_image_id).execute()
         
-        # A. Fetch ALL existing rows for this image (to catch duplicates/bad IDs)
-        existing_response = supabase.table("annotations_dev").select("*").eq("image_id", img_uuid).execute()
-        existing_rows = existing_response.data or []
+        existing_data = []
+        if existing.data and len(existing.data) > 0:
+            existing_data = existing.data[0]['annotations'] or []
         
-        # B. Collect existing annotations so we don't lose manual work
-        all_existing_anns = []
-        for row in existing_rows:
-            if row.get('annotations'):
-                # Deduplicate by ID if needed, or just append
-                all_existing_anns.extend(row['annotations'])
+        final_annotations = existing_data + new_annotations
         
-        # C. Combine with new AI results
-        final_annotations = all_existing_anns + new_annotations
+        # 5. UPSERT (using storage_path as key)
+        # Note: We must check if your table uses 'id' or 'image_id' as Primary Key. 
+        # Usually it's safer to delete by image_id first to avoid Primary Key conflicts.
         
-        # D. ATOMIC REPAIR: Delete bad rows, Insert correct row
-        if existing_rows:
-            # Delete ALL rows for this image to clean up random IDs
-            supabase.table("annotations_dev").delete().eq("image_id", img_uuid).execute()
-            
-        # Insert the SINGLE correct row where ID == ImageID
+        # A. Clean up old rows for this specific image path
+        supabase.table("annotations_dev").delete().eq("image_id", target_image_id).execute()
+        
+        # B. Insert fresh row with correct ID
         supabase.table("annotations_dev").insert({
-            "id": img_uuid,          # 🔥 THIS IS THE KEY FIX
-            "image_id": img_uuid,    
+            "image_id": target_image_id, # 🔥 NOW MATCHES REACT (users/...)
             "project_id": project_id,
             "user_id": target_user_id,
             "annotations": final_annotations
         }).execute()
 
-        # Update Progress
         pct = int(10 + ((i + 1) / len(images) * 90))
         update_status("running", progress=pct, logs=f"Annotated: {storage_path}")
 
-    update_status("completed", progress=100, logs="Success! Database repaired.")
+    update_status("completed", progress=100, logs="Success! IDs matched.")
     print("✨ SUCCESS: Check your React App now.", flush=True)
 
 except Exception as e:
