@@ -1,22 +1,55 @@
 import os
 import time
 import requests
+import torch
 import numpy as np
 import cv2
 from PIL import Image
 from supabase import create_client
 
-# 1. Setup Connections
+# --- 1. SETUP & INSTALLATION CHECK ---
+print("🚀 STARTING REAL SAM 2 PIPELINE...", flush=True)
+
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+except ImportError:
+    print("⚙️ Installing SAM 2 & Dependencies (this takes 1-2 mins)...", flush=True)
+    os.system('pip install -q git+https://github.com/facebookresearch/segment-anything-2.git')
+    os.system('pip install -q supabase requests opencv-python-headless')
+    from sam2.build_sam import build_sam2
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+# --- 2. CONFIGURATION ---
 url = os.environ.get('SB_URL')
 key = os.environ.get('SB_KEY')
-session_id = os.environ.get('SESSION_ID')
 job_id = os.environ.get('JOB_ID')
+session_id = os.environ.get('SESSION_ID')
 
-print(f"🚀 SCRIPT STARTED | Job: {job_id}", flush=True)
+# Download SAM 2 Weights (Tiny version for speed in Colab Free Tier)
+CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt"
+CHECKPOINT_PATH = "sam2_hiera_tiny.pt"
+CONFIG_NAME = "sam2_hiera_t.yaml"
 
-if not url or url == "undefined" or not key or key == "undefined":
-    print("❌ ERROR: Credentials missing.", flush=True)
-    exit(1)
+if not os.path.exists(CHECKPOINT_PATH):
+    print("⬇️ Downloading SAM 2 Weights...", flush=True)
+    os.system(f"wget -q {CHECKPOINT_URL}")
+
+# --- 3. INITIALIZE AI MODEL ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"💻 Loading Model on {device}...", flush=True)
+
+# Build the model
+sam2_model = build_sam2(CONFIG_NAME, CHECKPOINT_PATH, device=device, apply_postprocessing=False)
+mask_generator = SAM2AutomaticMaskGenerator(
+    model=sam2_model,
+    points_per_side=32,
+    pred_iou_thresh=0.8,
+    stability_score_thresh=0.9,
+    crop_n_layers=1,
+    crop_n_points_downscale_factor=2,
+    min_mask_region_area=100.0
+)
 
 supabase = create_client(url, key)
 
@@ -31,96 +64,93 @@ def update_status(status, progress=0, logs=""):
     except: pass
 
 def mask_to_polygon(mask, tolerance=1.0):
+    """Converts binary mask to [x, y, x, y...]"""
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return []
     cnt = max(contours, key=cv2.contourArea)
-    approx = cv2.approxPolyDP(cnt, tolerance * cv2.arcLength(cnt, True) / 1000, True)
+    epsilon = tolerance * cv2.arcLength(cnt, True) / 1000
+    approx = cv2.approxPolyDP(cnt, epsilon, True)
     return approx.flatten().tolist()
 
+# --- 4. PROCESSING LOOP ---
 try:
-    update_status("running", progress=5, logs="Fetching images...")
-
+    update_status("running", progress=10, logs="Fetching images...")
     response = supabase.table("images_dev").select("*").eq("job_id", job_id).execute()
     images = response.data
-    
+
     if not images:
-        update_status("completed", progress=100, logs="No images found.")
+        print("❌ No images found.", flush=True)
         exit(0)
 
-    print(f"📂 Processing {len(images)} images...", flush=True)
+    print(f"📂 Processing {len(images)} images with SAM 2...", flush=True)
 
     for i, img_row in enumerate(images):
-        # 🔥 CRITICAL FIX: Use 'storage_path' as the ID for annotations table
-        # This matches what your React App expects (users/.../image.jpg)
-        target_image_id = img_row['storage_path'] 
-        
+        target_image_id = img_row['storage_path'] # Matches React ID
         storage_path = img_row['storage_path']
-        project_id = img_row['project_id']
-        target_user_id = img_row['user_id'] 
-
-        print(f"📸 [{i+1}/{len(images)}] {target_image_id}", flush=True)
         
         # Download Image
         img_url = f"{url}/storage/v1/object/public/datasets/{storage_path}"
         try:
-            raw_image = Image.open(requests.get(img_url, stream=True).raw).convert("RGB")
-            image_np = np.array(raw_image)
-            h, w = image_np.shape[:2]
-        except:
-            print(f"⚠️ Failed to download: {storage_path}", flush=True)
+            pil_image = Image.open(requests.get(img_url, stream=True).raw).convert("RGB")
+            image_np = np.array(pil_image)
+        except Exception as e:
+            print(f"⚠️ Failed to download {storage_path}: {e}", flush=True)
             continue
 
-        # 3. GENERATE MASK (Simulation)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.rectangle(mask, (int(w*0.25), int(h*0.25)), (int(w*0.75), int(h*0.75)), 1, -1)
+        # 🔥 REAL AI INFERENCE
+        print(f"🧠 Segmenting: {storage_path}...", flush=True)
+        masks = mask_generator.generate(image_np)
         
-        polygon_points = mask_to_polygon(mask)
-
-        new_annotations = [
-            {
-                "id": f"colab_{int(time.time())}_{i}",
-                "label": "auto_detected",
+        # Convert SAM output to your DB Schema
+        new_annotations = []
+        for idx, ann in enumerate(masks):
+            # Only keep confident masks
+            if ann['stability_score'] < 0.85: continue
+            
+            # Convert binary mask to polygon
+            polygon_points = mask_to_polygon(ann['segmentation'])
+            
+            if len(polygon_points) < 6: continue # Skip noise
+            
+            # Calculate Bounding Box
+            xs = polygon_points[0::2]
+            ys = polygon_points[1::2]
+            
+            new_annotations.append({
+                "id": f"sam_{int(time.time())}_{idx}",
+                "label": "object", # Or use a classifier here if you want
                 "type": "polygon",
                 "points": polygon_points,
-                "x": min(polygon_points[0::2]), 
-                "y": min(polygon_points[1::2]),
-                "width": max(polygon_points[0::2]) - min(polygon_points[0::2]),
-                "height": max(polygon_points[1::2]) - min(polygon_points[1::2]),
-                "user_id": target_user_id, 
-                "isNew": True
-            }
-        ]
+                "x": min(xs),
+                "y": min(ys),
+                "width": max(xs) - min(xs),
+                "height": max(ys) - min(ys),
+                "user_id": img_row['user_id'],
+                "isNew": True,
+                "confidence": float(ann['stability_score'])
+            })
 
-        # 4. FETCH EXISTING (using storage_path as key)
+        # FETCH EXISTING (to preserve manual work)
         existing = supabase.table("annotations_dev").select("annotations").eq("image_id", target_image_id).execute()
-        
-        existing_data = []
-        if existing.data and len(existing.data) > 0:
-            existing_data = existing.data[0]['annotations'] or []
+        existing_data = existing.data[0]['annotations'] if existing.data and existing.data[0]['annotations'] else []
         
         final_annotations = existing_data + new_annotations
-        
-        # 5. UPSERT (using storage_path as key)
-        # Note: We must check if your table uses 'id' or 'image_id' as Primary Key. 
-        # Usually it's safer to delete by image_id first to avoid Primary Key conflicts.
-        
-        # A. Clean up old rows for this specific image path
+
+        # DELETE OLD & INSERT NEW
         supabase.table("annotations_dev").delete().eq("image_id", target_image_id).execute()
-        
-        # B. Insert fresh row with correct ID
         supabase.table("annotations_dev").insert({
-            "image_id": target_image_id, # 🔥 NOW MATCHES REACT (users/...)
-            "project_id": project_id,
-            "user_id": target_user_id,
+            "image_id": target_image_id,
+            "project_id": img_row['project_id'],
+            "user_id": img_row['user_id'],
             "annotations": final_annotations
         }).execute()
 
         pct = int(10 + ((i + 1) / len(images) * 90))
-        update_status("running", progress=pct, logs=f"Annotated: {storage_path}")
+        update_status("running", progress=pct, logs=f"Segmented {len(new_annotations)} objects in {storage_path}")
 
-    update_status("completed", progress=100, logs="Success! IDs matched.")
-    print("✨ SUCCESS: Check your React App now.", flush=True)
+    update_status("completed", progress=100, logs="SAM 2 Processing Complete!")
+    print("✨ SUCCESS: Real segmentation finished.", flush=True)
 
 except Exception as e:
-    print(f"❌ Error: {str(e)}", flush=True)
+    print(f"❌ CRITICAL ERROR: {e}", flush=True)
     update_status("failed", logs=str(e))
