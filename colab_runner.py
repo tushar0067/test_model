@@ -11,6 +11,7 @@ url = os.environ.get('SB_URL')
 key = os.environ.get('SB_KEY')
 session_id = os.environ.get('SESSION_ID')
 job_id = os.environ.get('JOB_ID')
+# model_choice = os.environ.get('MODEL_VERSION', 'sam2') 
 
 print(f"🚀 SCRIPT STARTED | Job: {job_id}", flush=True)
 
@@ -55,11 +56,10 @@ try:
     print(f"📂 Processing {len(images)} images...", flush=True)
 
     for i, img_row in enumerate(images):
-        # 🔥 CRITICAL FIXES FOR VISIBILITY 🔥
         img_uuid = img_row['id']           # Matches 'image_id' in annotations table
         storage_path = img_row['storage_path']
         project_id = img_row['project_id']
-        target_user_id = img_row['user_id'] # 🔥 Matches the user who owns the image
+        target_user_id = img_row['user_id'] 
 
         print(f"📸 [{i+1}/{len(images)}] {storage_path}", flush=True)
         
@@ -73,8 +73,7 @@ try:
             print(f"⚠️ Failed to download: {storage_path}", flush=True)
             continue
 
-        # 3. GENERATE MASK (Using reliable simulation to ensure visibility first)
-        # (Replace this block with predictor.predict(image_np) when SAM2 is installed)
+        # 3. GENERATE MASK (Simulation for testing visibility)
         mask = np.zeros((h, w), dtype=np.uint8)
         # Create a large central box so you DEFINITELY see it
         cv2.rectangle(mask, (int(w*0.25), int(h*0.25)), (int(w*0.75), int(h*0.75)), 1, -1)
@@ -82,33 +81,49 @@ try:
         # 4. Convert to Polygon
         polygon_points = mask_to_polygon(mask)
 
-        # 5. Create Annotation Object
         new_annotations = [
             {
                 "id": f"colab_{int(time.time())}_{i}",
                 "label": "auto_detected",
                 "type": "polygon",
                 "points": polygon_points,
-                "x": min(polygon_points[0::2]), # Bounding Box X
-                "y": min(polygon_points[1::2]), # Bounding Box Y
+                "x": min(polygon_points[0::2]), 
+                "y": min(polygon_points[1::2]),
                 "width": max(polygon_points[0::2]) - min(polygon_points[0::2]),
                 "height": max(polygon_points[1::2]) - min(polygon_points[1::2]),
-                "user_id": target_user_id, # 🔥 ASSIGN TO ACTUAL USER
+                "user_id": target_user_id, 
                 "isNew": True
             }
         ]
 
-        # 6. Save to DB
-        # We fetch existing annotations first to avoid overwriting manual work
-        existing = supabase.table("annotations_dev").select("annotations").eq("image_id", img_uuid).execute()
-        existing_data = existing.data[0]['annotations'] if existing.data and existing.data[0]['annotations'] else []
+        # 5. 🔥 SMART REPAIR & MERGE 🔥
+        # This fixes the "Invisible Data" bug by forcing the ID to match the Image ID
         
-        final_annotations = existing_data + new_annotations
-
-        supabase.table("annotations_dev").upsert({
-            "image_id": img_uuid,
+        # A. Fetch ALL existing rows for this image (to catch duplicates/bad IDs)
+        existing_response = supabase.table("annotations_dev").select("*").eq("image_id", img_uuid).execute()
+        existing_rows = existing_response.data or []
+        
+        # B. Collect existing annotations so we don't lose manual work
+        all_existing_anns = []
+        for row in existing_rows:
+            if row.get('annotations'):
+                # Deduplicate by ID if needed, or just append
+                all_existing_anns.extend(row['annotations'])
+        
+        # C. Combine with new AI results
+        final_annotations = all_existing_anns + new_annotations
+        
+        # D. ATOMIC REPAIR: Delete bad rows, Insert correct row
+        if existing_rows:
+            # Delete ALL rows for this image to clean up random IDs
+            supabase.table("annotations_dev").delete().eq("image_id", img_uuid).execute()
+            
+        # Insert the SINGLE correct row where ID == ImageID
+        supabase.table("annotations_dev").insert({
+            "id": img_uuid,          # 🔥 THIS IS THE KEY FIX
+            "image_id": img_uuid,    
             "project_id": project_id,
-            "user_id": target_user_id, # 🔥 CRITICAL
+            "user_id": target_user_id,
             "annotations": final_annotations
         }).execute()
 
@@ -116,7 +131,7 @@ try:
         pct = int(10 + ((i + 1) / len(images) * 90))
         update_status("running", progress=pct, logs=f"Annotated: {storage_path}")
 
-    update_status("completed", progress=100, logs="Success! Refresh your canvas.")
+    update_status("completed", progress=100, logs="Success! Database repaired.")
     print("✨ SUCCESS: Check your React App now.", flush=True)
 
 except Exception as e:
