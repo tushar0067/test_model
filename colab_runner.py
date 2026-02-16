@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import torch
 import numpy as np
 import cv2
 from PIL import Image
@@ -12,12 +11,11 @@ url = os.environ.get('SB_URL')
 key = os.environ.get('SB_KEY')
 session_id = os.environ.get('SESSION_ID')
 job_id = os.environ.get('JOB_ID')
-model_choice = os.environ.get('MODEL_VERSION', 'sam2') 
 
-print(f"🚀 Initializing {model_choice.upper()} Runner...", flush=True)
+print(f"🚀 SCRIPT STARTED | Job: {job_id}", flush=True)
 
 if not url or url == "undefined" or not key or key == "undefined":
-    print("❌ ERROR: Supabase credentials missing. Check your Vite .env file.", flush=True)
+    print("❌ ERROR: Credentials missing. Check React .env file.", flush=True)
     exit(1)
 
 supabase = create_client(url, key)
@@ -33,89 +31,93 @@ def update_status(status, progress=0, logs=""):
     except: pass
 
 def mask_to_polygon(mask, tolerance=1.0):
-    """Converts binary mask to [x, y, x, y...] format for your React Canvas"""
+    """Converts binary mask to [x, y, x, y...] for React Konva"""
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return []
     
-    # Get the largest detected contour
     cnt = max(contours, key=cv2.contourArea)
-    
-    # Simplify the polygon to keep the point count reasonable for the browser
     epsilon = tolerance * cv2.arcLength(cnt, True) / 1000
     approx = cv2.approxPolyDP(cnt, epsilon, True)
     
     return approx.flatten().tolist()
 
 try:
-    # 2. Model Loading
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"💻 Running on {device}", flush=True)
-    update_status("running", progress=10, logs="Loading SAM weights into GPU...")
-    
-    # Note: In a production Colab, you would initialize the SamPredictor here
-    # from sam2.build_sam import build_sam2
-    # predictor = build_sam2(model_cfg, checkpoint, device=device)
+    update_status("running", progress=5, logs="Fetching images...")
 
-    # 3. Fetch Images
+    # 2. Get Images
     response = supabase.table("images_dev").select("*").eq("job_id", job_id).execute()
     images = response.data
     
     if not images:
-        update_status("completed", progress=100, logs="No images found for this job.")
+        update_status("completed", progress=100, logs="No images found.")
         exit(0)
 
-    print(f"📂 Found {len(images)} images. Starting AI segmentation...", flush=True)
+    print(f"📂 Processing {len(images)} images...", flush=True)
 
     for i, img_row in enumerate(images):
-        img_uuid = img_row['id'] # Verified from your CSV
+        # 🔥 CRITICAL FIXES FOR VISIBILITY 🔥
+        img_uuid = img_row['id']           # Matches 'image_id' in annotations table
         storage_path = img_row['storage_path']
         project_id = img_row['project_id']
-        
-        print(f"📸 Processing [{i+1}/{len(images)}]: {storage_path}", flush=True)
-        update_status("running", progress=int(20 + (i/len(images)*80)), logs=f"Annotating: {storage_path}")
+        target_user_id = img_row['user_id'] # 🔥 Matches the user who owns the image
 
-        # Download and Prepare Image
+        print(f"📸 [{i+1}/{len(images)}] {storage_path}", flush=True)
+        
+        # Download Image
         img_url = f"{url}/storage/v1/object/public/datasets/{storage_path}"
-        raw_image = Image.open(requests.get(img_url, stream=True).raw).convert("RGB")
-        image_np = np.array(raw_image)
+        try:
+            raw_image = Image.open(requests.get(img_url, stream=True).raw).convert("RGB")
+            image_np = np.array(raw_image)
+            h, w = image_np.shape[:2]
+        except:
+            print(f"⚠️ Failed to download: {storage_path}", flush=True)
+            continue
 
-        # 4. RUN AI INFERENCE (Example: Automatic mask generation)
-        # masks = predictor.generate(image_np)
-        
-        # --- Logic Simulation for Polygon Conversion ---
-        h, w = image_np.shape[:2]
-        # We create a dummy central mask to verify the polygon pipeline
+        # 3. GENERATE MASK (Using reliable simulation to ensure visibility first)
+        # (Replace this block with predictor.predict(image_np) when SAM2 is installed)
         mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.rectangle(mask, (int(w*0.2), int(h*0.2)), (int(w*0.8), int(h*0.8)), 1, -1)
+        # Create a large central box so you DEFINITELY see it
+        cv2.rectangle(mask, (int(w*0.25), int(h*0.25)), (int(w*0.75), int(h*0.75)), 1, -1)
         
+        # 4. Convert to Polygon
         polygon_points = mask_to_polygon(mask)
 
-        # 5. Build Annotation following your specific schema
+        # 5. Create Annotation Object
         new_annotations = [
             {
                 "id": f"colab_{int(time.time())}_{i}",
-                "label": "sam_auto_label",
+                "label": "auto_detected",
                 "type": "polygon",
                 "points": polygon_points,
-                "x": min(polygon_points[0::2]) if polygon_points else 0,
-                "y": min(polygon_points[1::2]) if polygon_points else 0,
-                "width": (max(polygon_points[0::2]) - min(polygon_points[0::2])) if polygon_points else 0,
-                "height": (max(polygon_points[1::2]) - min(polygon_points[1::2])) if polygon_points else 0,
-                "user_id": "COLAB_WORKER"
+                "x": min(polygon_points[0::2]), # Bounding Box X
+                "y": min(polygon_points[1::2]), # Bounding Box Y
+                "width": max(polygon_points[0::2]) - min(polygon_points[0::2]),
+                "height": max(polygon_points[1::2]) - min(polygon_points[1::2]),
+                "user_id": target_user_id, # 🔥 ASSIGN TO ACTUAL USER
+                "isNew": True
             }
         ]
 
-        # 6. Upsert to Supabase
-        # This links the image UUID to the annotations_dev table
+        # 6. Save to DB
+        # We fetch existing annotations first to avoid overwriting manual work
+        existing = supabase.table("annotations_dev").select("annotations").eq("image_id", img_uuid).execute()
+        existing_data = existing.data[0]['annotations'] if existing.data and existing.data[0]['annotations'] else []
+        
+        final_annotations = existing_data + new_annotations
+
         supabase.table("annotations_dev").upsert({
-            "image_id": img_uuid, 
+            "image_id": img_uuid,
             "project_id": project_id,
-            "user_id": "COLAB_WORKER",
-            "annotations": new_annotations
+            "user_id": target_user_id, # 🔥 CRITICAL
+            "annotations": final_annotations
         }).execute()
 
-    update_status("completed", progress=100, logs="Success! All images processed.")
-    print("✨ Batch processing finished successfully.", flush=True)
+        # Update Progress
+        pct = int(10 + ((i + 1) / len(images) * 90))
+        update_status("running", progress=pct, logs=f"Annotated: {storage_path}")
+
+    update_status("completed", progress=100, logs="Success! Refresh your canvas.")
+    print("✨ SUCCESS: Check your React App now.", flush=True)
 
 except Exception as e:
     print(f"❌ Error: {str(e)}", flush=True)
