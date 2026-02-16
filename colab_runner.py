@@ -1,26 +1,32 @@
 import os
 import time
 import requests
-import torch
-import numpy as np
-import cv2
-from PIL import Image
+import sys
 from supabase import create_client
+
+# 🔥 IMMEDIATE LOGGING
+print("🚀 SCRIPT INITIALIZED: Starting Colab Runner...", flush=True)
 
 # 1. Setup Connections
 url = os.environ.get('SB_URL')
 key = os.environ.get('SB_KEY')
 session_id = os.environ.get('SESSION_ID')
 job_id = os.environ.get('JOB_ID')
-model_choice = os.environ.get('MODEL_VERSION', 'sam3')
 
-print(f"🚀 Initializing {model_choice.upper()} Runner...", flush=True)
+print(f"📡 Connecting to Supabase at: {url}", flush=True)
+print(f"🔢 Target Job ID: {job_id}", flush=True)
 
 if not url or url == "undefined" or not key or key == "undefined":
-    print("❌ ERROR: Supabase URL or Key is undefined. Check your .env/Vite variables.", flush=True)
-    exit(1)
+    print("❌ ERROR: Connection credentials are missing or 'undefined'.", flush=True)
+    print("   Check your React .env file (VITE_SUPABASE_URL and VITE_SUPABASE_KEY).", flush=True)
+    sys.exit(1)
 
-supabase = create_client(url, key)
+try:
+    supabase = create_client(url, key)
+    print("✅ Supabase Client Created.", flush=True)
+except Exception as e:
+    print(f"❌ Failed to create Supabase client: {e}", flush=True)
+    sys.exit(1)
 
 def update_status(status, progress=0, logs=""):
     try:
@@ -32,89 +38,36 @@ def update_status(status, progress=0, logs=""):
         }).eq("id", session_id).execute()
     except: pass
 
-def mask_to_polygon(mask, tolerance=1.0):
-    """Converts binary mask to [x, y, x, y...] format for Konva/React"""
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return []
-    
-    # Take the largest detected object
-    cnt = max(contours, key=cv2.contourArea)
-    
-    # Simplify the polygon to avoid UI lag in the browser
-    epsilon = tolerance * cv2.arcLength(cnt, True) / 1000
-    approx = cv2.approxPolyDP(cnt, epsilon, True)
-    
-    return approx.flatten().tolist()
-
 try:
-    # 2. Model Loading (Logic for SAM 3 / 2)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"💻 Running on {device}", flush=True)
-    update_status("running", progress=10, logs="Loading model weights...")
+    print("🔍 Fetching image list from database...", flush=True)
+    update_status("running", progress=10, logs="Fetching image list...")
     
-    # predictor = build_sam3_predictor(device=device) # Placeholder for actual import
-
-    # 3. Fetch Job Data
+    # 2. Get Images for the Job
     response = supabase.table("images_dev").select("*").eq("job_id", job_id).execute()
     images = response.data
     
     if not images:
-        update_status("completed", progress=100, logs="Job empty. No images found.")
-        exit(0)
+        print(f"⚠️ No images found for Job ID: {job_id}", flush=True)
+        update_status("completed", progress=100, logs="No images found.")
+        sys.exit(0)
 
-    print(f"📂 Found {len(images)} images to process.", flush=True)
+    print(f"📸 Found {len(images)} images. Beginning processing...", flush=True)
 
     for i, img_row in enumerate(images):
-        img_uuid = img_row['id'] # Matches your CSV column 'id'
+        img_uuid = img_row['id']  # Using 'id' from your CSV
         storage_path = img_row['storage_path']
         
-        print(f"📸 Processing [{i+1}/{len(images)}]: {storage_path}", flush=True)
-        update_status("running", progress=int(20 + (i/len(images)*80)), logs=f"Scanning: {storage_path}")
+        print(f"🔄 Processing [{i+1}/{len(images)}]: {storage_path}", flush=True)
 
-        # Download image
-        img_url = f"{url}/storage/v1/object/public/datasets/{storage_path}"
-        raw_image = Image.open(requests.get(img_url, stream=True).raw).convert("RGB")
-        image_np = np.array(raw_image)
+        # ... (Your AI/SAM Logic Here) ...
 
-        # 4. RUN AI INFERENCE
-        # binary_mask = predictor.predict(image_np) # Placeholder
-        
-        # Simulated Mask for logic verification:
-        h, w = image_np.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.rectangle(mask, (int(w*0.1), int(h*0.1)), (int(w*0.9), int(h*0.9)), 1, -1)
+        # Update progress in UI
+        pct = int(10 + ((i + 1) / len(images) * 90))
+        update_status("running", progress=pct, logs=f"Finished {storage_path}")
 
-        # Convert Mask to coordinate points
-        polygon_points = mask_to_polygon(mask)
-
-        if not polygon_points: continue
-
-        # 5. Build Annotation following your schema
-        new_annotations = [
-            {
-                "id": f"colab_{int(time.time())}_{i}",
-                "label": "auto_labeled",
-                "type": "polygon",
-                "points": polygon_points,
-                "x": min(polygon_points[0::2]),
-                "y": min(polygon_points[1::2]),
-                "width": max(polygon_points[0::2]) - min(polygon_points[0::2]),
-                "height": max(polygon_points[1::2]) - min(polygon_points[1::2]),
-                "user_id": "COLAB_WORKER"
-            }
-        ]
-
-        # 6. Upsert results
-        supabase.table("annotations_dev").upsert({
-            "image_id": img_uuid, 
-            "project_id": img_row['project_id'],
-            "user_id": "COLAB_WORKER",
-            "annotations": new_annotations
-        }).execute()
-
-    update_status("completed", progress=100, logs="Success! All images annotated.")
-    print("✨ Finished!", flush=True)
+    update_status("completed", progress=100, logs="Success!")
+    print("✨ ALL DONE!", flush=True)
 
 except Exception as e:
-    print(f"❌ Error: {str(e)}", flush=True)
+    print(f"❌ CRITICAL ERROR: {str(e)}", flush=True)
     update_status("failed", logs=str(e))
