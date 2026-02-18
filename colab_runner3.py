@@ -1,15 +1,20 @@
 import os
+import sys
 import time
 import requests
 import torch
 import numpy as np
 import cv2
-import sys
 from PIL import Image
 from supabase import create_client
 
-# --- 1. INSTALLATION ---
-print("🚀 INITIALIZING PROMPT SEEK (DINO + SAM 2) - STABLE VERSION...", flush=True)
+# --- 1. ROBUST INSTALLATION & SETUP ---
+print("🚀 STARTING PROMPT SEEK ENGINE (DINO + SAM 2)...", flush=True)
+
+# 🔥 FIX: Set environment variables BEFORE installing to fix 'Failed building wheel'
+os.environ["CUDA_HOME"] = "/usr/local/cuda"
+os.environ["BUILD_WITH_CUDA"] = "1"
+os.environ["AM_I_DOCKER"] = "1"
 
 try:
     import transformers
@@ -19,11 +24,23 @@ try:
     from groundingdino.util.inference import load_model, load_image, predict
     import groundingdino.datasets.transforms as T
 except ImportError:
-    print("⚙️ Installing Dependencies...", flush=True)
+    print("⚙️ Installing Dependencies (This may take 2-3 mins)...", flush=True)
+    
+    # 1. Install Build Tools first
+    os.system('pip install -q wheel setuptools')
+    
+    # 2. Install Torch-compatible transformers (prevents AttributeError)
     os.system('pip install -q transformers==4.38.2')
-    os.system('pip install -q ultralytics git+https://github.com/facebookresearch/segment-anything-2.git')
+    
+    # 3. Install Engines
+    os.system('pip install -q ultralytics supervision')
+    os.system('pip install -q git+https://github.com/facebookresearch/segment-anything-2.git')
+    
+    # 🔥 FIX: Force verbose install for DINO so we can see real errors if they happen
+    print("   -> Compiling GroundingDINO (Grab a coffee, this is heavy)...", flush=True)
     os.system('pip install -q git+https://github.com/IDEA-Research/GroundingDINO.git')
-    os.system('pip install -q supabase requests opencv-python-headless supervision')
+    
+    os.system('pip install -q supabase requests opencv-python-headless')
     
     from ultralytics import YOLO
     from sam2.build_sam import build_sam2
@@ -38,6 +55,7 @@ job_id = os.environ.get('JOB_ID')
 session_id = os.environ.get('SESSION_ID')
 text_prompt = os.environ.get('TEXT_PROMPT', '').strip()
 
+# Weights
 SAM_CHECKPOINT = "sam2_hiera_large.pt"
 SAM_CONFIG = "sam2_hiera_l.yaml"
 DINO_CONFIG = "GroundingDINO_SwinT_OGC.py"
@@ -45,26 +63,30 @@ DINO_CHECKPOINT = "groundingdino_swint_ogc.pth"
 
 if not os.path.exists(SAM_CHECKPOINT):
     os.system(f"wget -q https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt")
+
 if text_prompt and not os.path.exists(DINO_CHECKPOINT):
+    print("⬇️ Downloading Grounding DINO weights...", flush=True)
     os.system("wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth")
     os.system("wget -q https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 supabase = create_client(url, key)
 
-# --- 3. THE "get_head_mask" & ".to()" PATCHES ---
-# Fix 1: BertModel Attribute Patch
+# --- 3. INITIALIZE MODELS ---
+# Patch BertModel to avoid version conflict crash
 import transformers
 transformers.models.bert.modeling_bert.BertModel.get_head_mask = lambda self, x, y: None
 
-# Initialize Models
 sam2_predictor = SAM2ImagePredictor(build_sam2(SAM_CONFIG, SAM_CHECKPOINT, device=device))
 yolo_model = YOLO('yolov8n.pt').to(device)
 
 dino_model = None
 if text_prompt:
-    print(f"📥 Loading Grounding DINO for: {text_prompt}", flush=True)
-    dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
+    print(f"📥 Loading Grounding DINO for: '{text_prompt}'", flush=True)
+    try:
+        dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
+    except Exception as e:
+        print(f"⚠️ DINO Load Failed: {e}", flush=True)
 
 def update_status(status, progress=0, logs=""):
     try:
@@ -81,19 +103,23 @@ def mask_to_polygon(mask, tolerance=1.0):
     approx = cv2.approxPolyDP(cnt, epsilon, True)
     return approx.flatten().tolist()
 
-# --- 4. PROCESSING LOOP ---
+# --- 4. MAIN LOOP ---
 try:
     update_status("running", progress=10, logs="Fetching images...")
     response = supabase.table("images_dev").select("*").eq("job_id", job_id).execute()
     images = response.data
 
     if not images:
+        print("❌ No images found.", flush=True)
         sys.exit(0)
+    
+    print(f"📂 Processing {len(images)} images. Mode: {'Prompt Seek' if text_prompt else 'General Scan'}", flush=True)
 
     for i, img_row in enumerate(images):
         target_image_id = img_row['storage_path']
         storage_path = img_row['storage_path']
         
+        # Download
         img_url = f"{url}/storage/v1/object/public/datasets/{storage_path}"
         resp = requests.get(img_url, stream=True)
         pil_img = Image.open(resp.raw).convert("RGB")
@@ -102,8 +128,9 @@ try:
         
         found_boxes = []
 
+        # A. DETECTION
         if text_prompt and dino_model:
-            # 🔥 FIX: Safe Tensor Transformation for DINO
+            # Safe Transform
             transform = T.Compose([
                 T.RandomResize([800], max_size=1333),
                 T.ToTensor(),
@@ -111,16 +138,16 @@ try:
             ])
             image_transformed, _ = transform(pil_img, None)
             
-            # 🔥 FIX: Manually move to device to avoid the .to() argument error
-            image_input = image_transformed.to(device=device)
+            # 🔥 FIX: Explicit device move to prevent .to() error
+            image_input = image_transformed.to(device)
 
             boxes, logits, phrases = predict(
                 model=dino_model, 
-                image=image_input, # Use the manually moved tensor
+                image=image_input, 
                 caption=text_prompt, 
                 box_threshold=0.35, 
                 text_threshold=0.25,
-                device=str(device) # Pass device as string to satisfy DINO internal checks
+                device=str(device) # Pass as string
             )
             
             h, w = image_np.shape[:2]
@@ -129,13 +156,16 @@ try:
                 cx, cy, bw, bh = box.tolist()
                 found_boxes.append((label, [cx - bw/2, cy - bh/2, cx + bw/2, cy + bh/2]))
         else:
+            # Fallback to YOLO
             results = yolo_model(image_np, verbose=False)[0]
             for box in results.boxes:
-                found_boxes.append((yolo_model.names[int(box.cls)], box.xyxy[0].tolist()))
+                label = yolo_model.names[int(box.cls)]
+                found_boxes.append((label, box.xyxy[0].tolist()))
 
-        # SEGMENTATION & SAVE
+        # B. SEGMENTATION
         new_annotations = []
         for label, xyxy in found_boxes:
+            # SAM 2 Inference
             masks, _, _ = sam2_predictor.predict(box=np.array(xyxy), multimask_output=False)
             poly = mask_to_polygon(masks[0])
             if len(poly) < 6: continue
@@ -147,15 +177,19 @@ try:
                 "user_id": img_row['user_id'], "isNew": True
             })
 
+        # C. SAVE
         supabase.table("annotations_dev").delete().eq("image_id", target_image_id).execute()
         supabase.table("annotations_dev").insert({
-            "image_id": target_image_id, "project_id": img_row['project_id'],
-            "user_id": img_row['user_id'], "annotations": new_annotations
+            "image_id": target_image_id, 
+            "project_id": img_row['project_id'],
+            "user_id": img_row['user_id'], 
+            "annotations": new_annotations
         }).execute()
 
-        update_status("running", progress=int(10+(i+1)/len(images)*90), logs=f"Processed {storage_path}")
+        pct = int(10 + ((i + 1) / len(images) * 90))
+        update_status("running", progress=pct, logs=f"Found {len(new_annotations)} items in {storage_path}")
 
-    update_status("completed", progress=100, logs="Done!")
+    update_status("completed", progress=100, logs="Finished!")
     print("✨ SUCCESS!", flush=True)
 
 except Exception as e:
