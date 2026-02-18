@@ -4,6 +4,7 @@ import requests
 import torch
 import numpy as np
 import cv2
+import sys
 from PIL import Image
 from supabase import create_client
 
@@ -11,16 +12,20 @@ from supabase import create_client
 print("🚀 INITIALIZING PROMPT SEEK ENGINE (DINO + SAM 2)...", flush=True)
 
 try:
+    import transformers
     from ultralytics import YOLO
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
     from groundingdino.util.inference import load_model, load_image, predict
     import groundingdino.datasets.transforms as T
 except ImportError:
-    print("⚙️ Installing Heavy Dependencies (DINO, SAM2, Ultralytics)...", flush=True)
+    print("⚙️ Installing Fixed Dependencies (DINO, SAM2, Ultralytics)...", flush=True)
+    # 🔥 FIX: Force transformers version 4.38.2 to avoid 'get_head_mask' error
+    os.system('pip install -q transformers==4.38.2')
     os.system('pip install -q ultralytics git+https://github.com/facebookresearch/segment-anything-2.git')
     os.system('pip install -q git+https://github.com/IDEA-Research/GroundingDINO.git')
     os.system('pip install -q supabase requests opencv-python-headless supervision')
+    
     from ultralytics import YOLO
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -42,7 +47,9 @@ DINO_CHECKPOINT = "groundingdino_swint_ogc.pth"
 
 # Download Weights if missing
 if not os.path.exists(SAM_CHECKPOINT):
+    print("⬇️ Downloading SAM 2 Weights...", flush=True)
     os.system(f"wget -q https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt")
+
 if text_prompt and not os.path.exists(DINO_CHECKPOINT):
     print("⬇️ Downloading Grounding DINO weights for Prompt Seek...", flush=True)
     os.system("wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth")
@@ -51,13 +58,22 @@ if text_prompt and not os.path.exists(DINO_CHECKPOINT):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 supabase = create_client(url, key)
 
-# Initialize Models
+# --- 3. MODEL INITIALIZATION & PATCHING ---
 sam2_predictor = SAM2ImagePredictor(build_sam2(SAM_CONFIG, SAM_CHECKPOINT, device=device))
 yolo_model = YOLO('yolov8n.pt').to(device)
 
 dino_model = None
 if text_prompt:
-    dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
+    try:
+        print(f"📥 Loading Grounding DINO for: {text_prompt}", flush=True)
+        dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
+    except AttributeError as e:
+        if "get_head_mask" in str(e):
+            print("🔧 Applying 'get_head_mask' patch to BertModel...", flush=True)
+            import transformers
+            # Force the attribute into the class to bypass the old Warper bug
+            transformers.models.bert.modeling_bert.BertModel.get_head_mask = lambda self, x, y: None
+            dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
 
 def update_status(status, progress=0, logs=""):
     try:
@@ -74,15 +90,20 @@ def mask_to_polygon(mask, tolerance=1.0):
     approx = cv2.approxPolyDP(cnt, epsilon, True)
     return approx.flatten().tolist()
 
-# --- 3. CORE PROCESSING LOOP ---
+# --- 4. CORE PROCESSING LOOP ---
 try:
     update_status("running", progress=10, logs="Fetching images from job...")
     response = supabase.table("images_dev").select("*").eq("job_id", job_id).execute()
     images = response.data
 
+    if not images:
+        print("❌ No images found.", flush=True)
+        sys.exit(0)
+
     print(f"📂 Processing {len(images)} images. Mode: {'Prompt Seek' if text_prompt else 'General Scan'}", flush=True)
 
     for i, img_row in enumerate(images):
+        # 🔥 VISIBILITY FIX: image_id = storage_path
         target_image_id = img_row['storage_path']
         storage_path = img_row['storage_path']
         
@@ -112,9 +133,9 @@ try:
                 text_threshold=0.25,
                 device=device
             )
-            # Convert DINO CXCYWH to XYXY
             h, w = image_np.shape[:2]
             for box, label in zip(boxes, phrases):
+                # Convert DINO CXCYWH to XYXY
                 box = box * torch.Tensor([w, h, w, h])
                 center_x, center_y, width, height = box.tolist()
                 x1, y1 = center_x - width/2, center_y - height/2
@@ -161,7 +182,7 @@ try:
         pct = int(10 + ((i + 1) / len(images) * 90))
         update_status("running", progress=pct, logs=f"Found {len(new_annotations)} '{text_prompt or 'objects'}' in {storage_path}")
 
-    update_status("completed", progress=100, logs="Prompt Seek Complete!")
+    update_status("completed", progress=100, logs="Processing Complete!")
     print("✨ DONE!", flush=True)
 
 except Exception as e:
