@@ -11,7 +11,7 @@ from supabase import create_client
 # --- 1. ROBUST INSTALLATION & SETUP ---
 print("🚀 STARTING PROMPT SEEK ENGINE (DINO + SAM 2)...", flush=True)
 
-# 🔥 FIX: Set environment variables BEFORE installing to fix 'Failed building wheel'
+# Set environment variables BEFORE installing to fix 'Failed building wheel'
 os.environ["CUDA_HOME"] = "/usr/local/cuda"
 os.environ["BUILD_WITH_CUDA"] = "1"
 os.environ["AM_I_DOCKER"] = "1"
@@ -25,21 +25,13 @@ try:
     import groundingdino.datasets.transforms as T
 except ImportError:
     print("⚙️ Installing Dependencies (This may take 2-3 mins)...", flush=True)
-    
-    # 1. Install Build Tools first
     os.system('pip install -q wheel setuptools')
-    
-    # 2. Install Torch-compatible transformers (prevents AttributeError)
     os.system('pip install -q transformers==4.38.2')
-    
-    # 3. Install Engines
     os.system('pip install -q ultralytics supervision')
     os.system('pip install -q git+https://github.com/facebookresearch/segment-anything-2.git')
-    
-    # 🔥 FIX: Force verbose install for DINO so we can see real errors if they happen
-    print("   -> Compiling GroundingDINO (Grab a coffee, this is heavy)...", flush=True)
+    # Force verbose install for DINO
+    print("   -> Compiling GroundingDINO...", flush=True)
     os.system('pip install -q git+https://github.com/IDEA-Research/GroundingDINO.git')
-    
     os.system('pip install -q supabase requests opencv-python-headless')
     
     from ultralytics import YOLO
@@ -55,7 +47,7 @@ job_id = os.environ.get('JOB_ID')
 session_id = os.environ.get('SESSION_ID')
 text_prompt = os.environ.get('TEXT_PROMPT', '').strip()
 
-# Weights
+# Weights - Use TINY SAM for CPU speed if needed
 SAM_CHECKPOINT = "sam2_hiera_large.pt"
 SAM_CONFIG = "sam2_hiera_l.yaml"
 DINO_CONFIG = "GroundingDINO_SwinT_OGC.py"
@@ -69,11 +61,13 @@ if text_prompt and not os.path.exists(DINO_CHECKPOINT):
     os.system("wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth")
     os.system("wget -q https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"💻 Running on: {device}", flush=True)
+
 supabase = create_client(url, key)
 
 # --- 3. INITIALIZE MODELS ---
-# Patch BertModel to avoid version conflict crash
+# Patch BertModel
 import transformers
 transformers.models.bert.modeling_bert.BertModel.get_head_mask = lambda self, x, y: None
 
@@ -130,7 +124,6 @@ try:
 
         # A. DETECTION
         if text_prompt and dino_model:
-            # Safe Transform
             transform = T.Compose([
                 T.RandomResize([800], max_size=1333),
                 T.ToTensor(),
@@ -138,8 +131,13 @@ try:
             ])
             image_transformed, _ = transform(pil_img, None)
             
-            # 🔥 FIX: Explicit device move to prevent .to() error
-            image_input = image_transformed.to(device)
+            # 🔥 CPU FIX: Be explicit about device argument
+            # Instead of image_transformed.to(device), we pass device=str(device) if it's 'cpu'
+            # But standard practice for max compatibility:
+            if device == 'cpu':
+                image_input = image_transformed # It's already CPU tensor
+            else:
+                image_input = image_transformed.to(device)
 
             boxes, logits, phrases = predict(
                 model=dino_model, 
@@ -147,7 +145,7 @@ try:
                 caption=text_prompt, 
                 box_threshold=0.35, 
                 text_threshold=0.25,
-                device=str(device) # Pass as string
+                device=str(device) # Pass as string "cpu" or "cuda"
             )
             
             h, w = image_np.shape[:2]
@@ -165,7 +163,6 @@ try:
         # B. SEGMENTATION
         new_annotations = []
         for label, xyxy in found_boxes:
-            # SAM 2 Inference
             masks, _, _ = sam2_predictor.predict(box=np.array(xyxy), multimask_output=False)
             poly = mask_to_polygon(masks[0])
             if len(poly) < 6: continue
