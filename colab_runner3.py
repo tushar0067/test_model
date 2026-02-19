@@ -33,10 +33,21 @@ try:
     import groundingdino.datasets.transforms as T
 except ImportError:
     print("⚙️ Installing dependencies...")
+
+    # Set CUDA vars for the shell (os.system spawns new shell, doesn't inherit Python env)
+    cuda_env = 'CUDA_HOME=/usr/local/cuda BUILD_WITH_CUDA=1 AM_I_DOCKER=1 TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6" '
+
+    # Install build tools first
+    os.system("apt-get install -qq -y ninja-build > /dev/null 2>&1")
+    os.system("pip install -q wheel setuptools ninja")
+
+    # Install everything except DINO first
     os.system("pip install -q ultralytics supervision")
     os.system("pip install -q git+https://github.com/facebookresearch/segment-anything-2.git")
-    os.system("pip install -q git+https://github.com/IDEA-Research/GroundingDINO.git")
     os.system("pip install -q supabase opencv-python-headless")
+
+    # Install GroundingDINO with CUDA env vars prefixed in the SAME shell command
+    os.system(f"{cuda_env} pip install git+https://github.com/IDEA-Research/GroundingDINO.git")
 
     from ultralytics import YOLO
     from sam2.build_sam import build_sam2
