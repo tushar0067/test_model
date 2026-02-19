@@ -238,7 +238,7 @@ try:
                     continue
 
                 new_annotations.append({
-                    "id": f"seek_{int(time.time())}_{label}",
+                    "id": f"seek_{time.time_ns()}_{i}_{label}",
                     "label": label,
                     "type": "polygon",
                     "points": poly,
