@@ -215,7 +215,7 @@ try:
                     caption=TEXT_PROMPT,
                     box_threshold=0.35,
                     text_threshold=0.25,
-                    device=device
+                    device=str(device)
                 )
 
             h, w = image_np.shape[:2]
