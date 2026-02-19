@@ -22,6 +22,12 @@ if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
 
 # ============================================================
+# ✅ BERT PATCH — MUST be here, BEFORE the try/import block
+# ============================================================
+import transformers
+transformers.models.bert.modeling_bert.BertModel.get_head_mask = lambda self, x, y: [None] * y
+
+# ============================================================
 # 2. INSTALL DEPENDENCIES
 # ============================================================
 
@@ -34,6 +40,7 @@ try:
     from sam2.sam2_image_predictor import SAM2ImagePredictor
     from groundingdino.util.inference import load_model, predict
     import groundingdino.datasets.transforms as T
+    print("✅ All dependencies already installed", flush=True)
 
 except ImportError:
     print("⚙️ Installing dependencies...", flush=True)
@@ -44,19 +51,25 @@ except ImportError:
     os.system("pip install -q git+https://github.com/facebookresearch/segment-anything-2.git")
     os.system("pip install -q supabase opencv-python-headless")
 
-    # Clone and install GroundingDINO as editable (avoids wheel build error)
+    # ✅ Fix CUDA symlink for T4 GPU
+    os.system("ln -sf /usr/local/cuda/lib64/libcudart.so /usr/lib/libcudart.so 2>/dev/null")
+
+    # Clone and install GroundingDINO
     if not os.path.exists("/content/GroundingDINO"):
         print("   -> Cloning GroundingDINO...", flush=True)
         os.system("git clone -q https://github.com/IDEA-Research/GroundingDINO.git /content/GroundingDINO")
 
-    print("   -> Installing GroundingDINO...", flush=True)
-    os.system(
+    print("   -> Installing GroundingDINO (with CUDA)...", flush=True)
+    ret = os.system(
         "cd /content/GroundingDINO && "
         "CUDA_HOME=/usr/local/cuda "
         "BUILD_WITH_CUDA=1 "
         "TORCH_CUDA_ARCH_LIST='7.5;8.0;8.6' "
         "pip install -q -e . --no-build-isolation"
     )
+    if ret != 0:
+        print("   -> CUDA build failed, trying CPU-only fallback...", flush=True)
+        os.system("cd /content/GroundingDINO && pip install -q -e . --no-build-isolation --no-deps")
 
     sys.path.insert(0, "/content/GroundingDINO")
 
@@ -76,8 +89,8 @@ JOB_ID      = os.environ.get("JOB_ID")
 SESSION_ID  = os.environ.get("SESSION_ID")
 TEXT_PROMPT = os.environ.get("TEXT_PROMPT", "").strip()
 
-SAM_CHECKPOINT = "sam2_hiera_large.pt"
-SAM_CONFIG     = "sam2_hiera_l.yaml"
+SAM_CHECKPOINT  = "sam2_hiera_large.pt"
+SAM_CONFIG      = "sam2_hiera_l.yaml"
 DINO_CHECKPOINT = "groundingdino_swint_ogc.pth"
 DINO_CONFIG     = "GroundingDINO_SwinT_OGC.py"
 
@@ -142,10 +155,10 @@ dino_model = None
 if TEXT_PROMPT:
     print(f"📦 Loading GroundingDINO for: '{TEXT_PROMPT}'", flush=True)
     try:
-        dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
-        dino_model.to(device)
+        dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT)
+        dino_model = dino_model.to(device)
         dino_model.eval()
-        print("✅ GroundingDINO loaded!", flush=True)
+        print("✅ GroundingDINO loaded on GPU!", flush=True)
     except Exception as e:
         print(f"⚠️ DINO load failed, falling back to YOLO: {e}", flush=True)
         dino_model = None
@@ -207,9 +220,16 @@ try:
 
             h, w = image_np.shape[:2]
             for box, label in zip(boxes, phrases):
-                box = box * torch.tensor([w, h, w, h], dtype=torch.float32).to(device)
+                # DINO outputs normalized cx,cy,w,h
                 cx, cy, bw, bh = box.tolist()
-                found_boxes.append((label, [cx - bw/2, cy - bh/2, cx + bw/2, cy + bh/2]))
+                x1 = (cx - bw / 2) * w
+                y1 = (cy - bh / 2) * h
+                x2 = (cx + bw / 2) * w
+                y2 = (cy + bh / 2) * h
+                # Skip degenerate boxes
+                if x2 - x1 < 10 or y2 - y1 < 10:
+                    continue
+                found_boxes.append((label, [x1, y1, x2, y2]))
 
             print(f"     DINO found {len(found_boxes)} objects", flush=True)
 
@@ -227,7 +247,7 @@ try:
 
         new_annotations = []
 
-        for label, xyxy in found_boxes:
+        for j, (label, xyxy) in enumerate(found_boxes):
             try:
                 masks, _, _ = sam_predictor.predict(
                     box=np.array(xyxy),
@@ -238,7 +258,7 @@ try:
                     continue
 
                 new_annotations.append({
-                    "id": f"seek_{time.time_ns()}_{i}_{label}",
+                    "id": f"seek_{time.time_ns()}_{i}_{j}_{label}",
                     "label": label,
                     "type": "polygon",
                     "points": poly,
