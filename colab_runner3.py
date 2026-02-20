@@ -34,7 +34,105 @@ import transformers
 transformers.models.bert.modeling_bert.BertModel.get_head_mask = lambda self, x, y: [None] * y
 
 # ============================================================
-# 4. INSTALL DEPENDENCIES
+# 4. PATCH ms_deform_attn ON DISK — must be before import
+#    Fixes '_C is not defined' when CUDA ops fail to compile
+# ============================================================
+
+def _patch_ms_deform_attn_file():
+    ms_deform_file = "/content/GroundingDINO/groundingdino/models/GroundingDINO/ms_deform_attn.py"
+    if not os.path.exists(ms_deform_file):
+        print("ℹ️ ms_deform_attn.py not found yet (will patch after clone)", flush=True)
+        return False
+
+    with open(ms_deform_file, "r") as f:
+        content = f.read()
+
+    if "# ✅ PATCHED_FALLBACK" in content:
+        print("✅ ms_deform_attn already patched", flush=True)
+        return True
+
+    # Write a completely replaced forward method
+    patched_forward = '''
+    def forward(self, query, reference_points, input_flatten, input_spatial_shapes,
+                input_level_start_index, input_padding_mask=None):
+        # ✅ PATCHED_FALLBACK: pure PyTorch — no _C CUDA ops needed
+        N, Len_q, _ = query.shape
+        N, Len_in, _ = input_flatten.shape
+        value = self.value_proj(input_flatten)
+        if input_padding_mask is not None:
+            value = value.masked_fill(input_padding_mask[..., None], float(0))
+        value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
+        sampling_offsets = self.sampling_offsets(query).view(
+            N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        attention_weights = self.attention_weights(query).view(
+            N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        attention_weights = torch.nn.functional.softmax(attention_weights, -1).view(
+            N, Len_q, self.n_heads, self.n_levels, self.n_points)
+        if reference_points.shape[-1] == 2:
+            offset_normalizer = torch.stack(
+                [input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+            sampling_locations = (
+                reference_points[:, :, None, :, None, :] +
+                sampling_offsets / offset_normalizer[None, None, None, :, None, :])
+        elif reference_points.shape[-1] == 4:
+            sampling_locations = (
+                reference_points[:, :, None, :, None, :2] +
+                sampling_offsets / self.n_points *
+                reference_points[:, :, None, :, None, 2:] * 0.5)
+        else:
+            raise ValueError(f"Last dim of reference_points must be 2 or 4, but got {reference_points.shape[-1]}")
+        # Pure PyTorch attention
+        N_, S_, M_, D_ = value.shape
+        _, Lq_, M_, L_, P_, _ = sampling_locations.shape
+        value_list = value.split([int(H_ * W_) for H_, W_ in input_spatial_shapes], dim=1)
+        sampling_grids = 2 * sampling_locations - 1
+        sampling_value_list = []
+        for lid_, (H_, W_) in enumerate(input_spatial_shapes):
+            H_, W_ = int(H_), int(W_)
+            value_l_ = value_list[lid_].flatten(2).transpose(1, 2).reshape(N_ * M_, D_, H_, W_)
+            sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
+            sampling_value_l_ = torch.nn.functional.grid_sample(
+                value_l_, sampling_grid_l_, mode="bilinear",
+                padding_mode="zeros", align_corners=False)
+            sampling_value_list.append(sampling_value_l_)
+        attention_weights_r = attention_weights.transpose(1, 2).reshape(N_ * M_, 1, Lq_, L_ * P_)
+        output = (torch.stack(sampling_value_list, dim=-2).flatten(-2) *
+                  attention_weights_r).sum(-1).view(N_, M_ * D_, Lq_)
+        output = output.transpose(1, 2).contiguous()
+        output = self.output_proj(output)
+        return output
+'''
+
+    # Find and replace the existing forward method
+    import re
+    # Replace from 'def forward' to end of method (next 'def ' at same indent or end of class)
+    new_content = re.sub(
+        r'    def forward\(self, query.*?(?=\n    def |\nclass |\Z)',
+        patched_forward,
+        content,
+        flags=re.DOTALL
+    )
+
+    if new_content != content:
+        with open(ms_deform_file, "w") as f:
+            f.write(new_content)
+        print("✅ ms_deform_attn.py patched on disk!", flush=True)
+        return True
+    else:
+        print("⚠️ Patch regex did not match — trying simple replacement", flush=True)
+        # Simpler fallback: just comment out the _C line
+        content = content.replace(
+            "output = _C.ms_deform_attn_forward(",
+            "output = None  # _C.ms_deform_attn_forward( -- DISABLED\n        raise RuntimeError('_C disabled')\n        output = _C.ms_deform_attn_forward("
+        )
+        with open(ms_deform_file, "w") as f:
+            f.write(content)
+        return True
+
+_patch_ms_deform_attn_file()
+
+# ============================================================
+# 5. INSTALL DEPENDENCIES
 # ============================================================
 
 try:
@@ -64,6 +162,9 @@ except ImportError:
         print("   -> Cloning GroundingDINO...", flush=True)
         os.system("git clone -q https://github.com/IDEA-Research/GroundingDINO.git /content/GroundingDINO")
 
+    # ✅ Patch the file RIGHT AFTER cloning, before install
+    _patch_ms_deform_attn_file()
+
     print("   -> Installing GroundingDINO...", flush=True)
     ret = os.system(
         "cd /content/GroundingDINO && "
@@ -83,77 +184,6 @@ except ImportError:
     from sam2.sam2_image_predictor import SAM2ImagePredictor
     from groundingdino.util.inference import load_model, predict
     import groundingdino.datasets.transforms as T
-
-# ============================================================
-# 5. PATCH ms_deform_attn — fixes '_C is not defined' error
-#    when CUDA ops failed to compile
-# ============================================================
-
-def _patch_ms_deform_attn():
-    try:
-        import groundingdino.models.GroundingDINO.ms_deform_attn as ms_attn
-
-        def ms_deform_attn_core_pytorch(value, value_spatial_shapes,
-                                        sampling_locations, attention_weights):
-            N_, S_, M_, D_ = value.shape
-            _, Lq_, M_, L_, P_, _ = sampling_locations.shape
-            value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
-            sampling_grids = 2 * sampling_locations - 1
-            sampling_value_list = []
-            for lid_, (H_, W_) in enumerate(value_spatial_shapes):
-                value_l_ = (value_list[lid_].flatten(2).transpose(1, 2)
-                            .reshape(N_ * M_, D_, H_, W_))
-                sampling_grid_l_ = (sampling_grids[:, :, :, lid_]
-                                    .transpose(1, 2).flatten(0, 1))
-                sampling_value_l_ = torch.nn.functional.grid_sample(
-                    value_l_, sampling_grid_l_,
-                    mode='bilinear', padding_mode='zeros', align_corners=False)
-                sampling_value_list.append(sampling_value_l_)
-            attention_weights = (attention_weights.transpose(1, 2)
-                                 .reshape(N_ * M_, 1, Lq_, L_ * P_))
-            output = ((torch.stack(sampling_value_list, dim=-2).flatten(-2) *
-                       attention_weights).sum(-1).view(N_, M_ * D_, Lq_))
-            return output.transpose(1, 2).contiguous()
-
-        def patched_forward(self, query, reference_points, input_flatten,
-                            input_spatial_shapes, input_level_start_index,
-                            input_padding_mask=None):
-            N, Len_q, _ = query.shape
-            N, Len_in, _ = input_flatten.shape
-            value = self.value_proj(input_flatten)
-            if input_padding_mask is not None:
-                value = value.masked_fill(input_padding_mask[..., None], float(0))
-            value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
-            sampling_offsets = self.sampling_offsets(query).view(
-                N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
-            attention_weights = self.attention_weights(query).view(
-                N, Len_q, self.n_heads, self.n_levels * self.n_points)
-            attention_weights = torch.nn.functional.softmax(
-                attention_weights, -1).view(
-                N, Len_q, self.n_heads, self.n_levels, self.n_points)
-            if reference_points.shape[-1] == 2:
-                offset_normalizer = torch.stack(
-                    [input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
-                sampling_locations = (
-                    reference_points[:, :, None, :, None, :] +
-                    sampling_offsets / offset_normalizer[None, None, None, :, None, :])
-            elif reference_points.shape[-1] == 4:
-                sampling_locations = (
-                    reference_points[:, :, None, :, None, :2] +
-                    sampling_offsets / self.n_points *
-                    reference_points[:, :, None, :, None, 2:] * 0.5)
-            output = ms_deform_attn_core_pytorch(
-                value, input_spatial_shapes, sampling_locations, attention_weights)
-            output = self.output_proj(output)
-            return output
-
-        ms_attn.MSDeformAttn.forward = patched_forward
-        print("✅ ms_deform_attn patched (Python fallback active)", flush=True)
-
-    except Exception as e:
-        print(f"⚠️ ms_deform_attn patch failed: {e}", flush=True)
-
-_patch_ms_deform_attn()
 
 # ============================================================
 # 6. CONFIG
