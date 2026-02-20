@@ -22,10 +22,21 @@ if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
 
 # ============================================================
-# 2. INSTALL DEPENDENCIES
+# 2. PIN TRANSFORMERS — always runs, fixes DINO compatibility
 # ============================================================
-print("📌 Pinning transformers to 4.38.2 for DINO compatibility...", flush=True)
+print("📌 Pinning transformers==4.38.2...", flush=True)
 os.system("pip install -q transformers==4.38.2")
+
+# ============================================================
+# 3. BERT PATCH — must be before any groundingdino import
+# ============================================================
+import transformers
+transformers.models.bert.modeling_bert.BertModel.get_head_mask = lambda self, x, y: [None] * y
+
+# ============================================================
+# 4. INSTALL DEPENDENCIES
+# ============================================================
+
 try:
     if os.path.exists("/content/GroundingDINO"):
         sys.path.insert(0, "/content/GroundingDINO")
@@ -35,6 +46,7 @@ try:
     from sam2.sam2_image_predictor import SAM2ImagePredictor
     from groundingdino.util.inference import load_model, predict
     import groundingdino.datasets.transforms as T
+    print("✅ All dependencies already installed", flush=True)
 
 except ImportError:
     print("⚙️ Installing dependencies...", flush=True)
@@ -45,19 +57,24 @@ except ImportError:
     os.system("pip install -q git+https://github.com/facebookresearch/segment-anything-2.git")
     os.system("pip install -q supabase opencv-python-headless")
 
-    # Clone and install GroundingDINO as editable (avoids wheel build error)
+    # Fix CUDA symlink for T4
+    os.system("ln -sf /usr/local/cuda/lib64/libcudart.so /usr/lib/libcudart.so 2>/dev/null")
+
     if not os.path.exists("/content/GroundingDINO"):
         print("   -> Cloning GroundingDINO...", flush=True)
         os.system("git clone -q https://github.com/IDEA-Research/GroundingDINO.git /content/GroundingDINO")
 
     print("   -> Installing GroundingDINO...", flush=True)
-    os.system(
+    ret = os.system(
         "cd /content/GroundingDINO && "
         "CUDA_HOME=/usr/local/cuda "
         "BUILD_WITH_CUDA=1 "
         "TORCH_CUDA_ARCH_LIST='7.5;8.0;8.6' "
         "pip install -q -e . --no-build-isolation"
     )
+    if ret != 0:
+        print("   -> CUDA build failed, trying CPU-only fallback...", flush=True)
+        os.system("cd /content/GroundingDINO && pip install -q -e . --no-build-isolation --no-deps")
 
     sys.path.insert(0, "/content/GroundingDINO")
 
@@ -68,7 +85,78 @@ except ImportError:
     import groundingdino.datasets.transforms as T
 
 # ============================================================
-# 3. CONFIG
+# 5. PATCH ms_deform_attn — fixes '_C is not defined' error
+#    when CUDA ops failed to compile
+# ============================================================
+
+def _patch_ms_deform_attn():
+    try:
+        import groundingdino.models.GroundingDINO.ms_deform_attn as ms_attn
+
+        def ms_deform_attn_core_pytorch(value, value_spatial_shapes,
+                                        sampling_locations, attention_weights):
+            N_, S_, M_, D_ = value.shape
+            _, Lq_, M_, L_, P_, _ = sampling_locations.shape
+            value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
+            sampling_grids = 2 * sampling_locations - 1
+            sampling_value_list = []
+            for lid_, (H_, W_) in enumerate(value_spatial_shapes):
+                value_l_ = (value_list[lid_].flatten(2).transpose(1, 2)
+                            .reshape(N_ * M_, D_, H_, W_))
+                sampling_grid_l_ = (sampling_grids[:, :, :, lid_]
+                                    .transpose(1, 2).flatten(0, 1))
+                sampling_value_l_ = torch.nn.functional.grid_sample(
+                    value_l_, sampling_grid_l_,
+                    mode='bilinear', padding_mode='zeros', align_corners=False)
+                sampling_value_list.append(sampling_value_l_)
+            attention_weights = (attention_weights.transpose(1, 2)
+                                 .reshape(N_ * M_, 1, Lq_, L_ * P_))
+            output = ((torch.stack(sampling_value_list, dim=-2).flatten(-2) *
+                       attention_weights).sum(-1).view(N_, M_ * D_, Lq_))
+            return output.transpose(1, 2).contiguous()
+
+        def patched_forward(self, query, reference_points, input_flatten,
+                            input_spatial_shapes, input_level_start_index,
+                            input_padding_mask=None):
+            N, Len_q, _ = query.shape
+            N, Len_in, _ = input_flatten.shape
+            value = self.value_proj(input_flatten)
+            if input_padding_mask is not None:
+                value = value.masked_fill(input_padding_mask[..., None], float(0))
+            value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
+            sampling_offsets = self.sampling_offsets(query).view(
+                N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+            attention_weights = self.attention_weights(query).view(
+                N, Len_q, self.n_heads, self.n_levels * self.n_points)
+            attention_weights = torch.nn.functional.softmax(
+                attention_weights, -1).view(
+                N, Len_q, self.n_heads, self.n_levels, self.n_points)
+            if reference_points.shape[-1] == 2:
+                offset_normalizer = torch.stack(
+                    [input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+                sampling_locations = (
+                    reference_points[:, :, None, :, None, :] +
+                    sampling_offsets / offset_normalizer[None, None, None, :, None, :])
+            elif reference_points.shape[-1] == 4:
+                sampling_locations = (
+                    reference_points[:, :, None, :, None, :2] +
+                    sampling_offsets / self.n_points *
+                    reference_points[:, :, None, :, None, 2:] * 0.5)
+            output = ms_deform_attn_core_pytorch(
+                value, input_spatial_shapes, sampling_locations, attention_weights)
+            output = self.output_proj(output)
+            return output
+
+        ms_attn.MSDeformAttn.forward = patched_forward
+        print("✅ ms_deform_attn patched (Python fallback active)", flush=True)
+
+    except Exception as e:
+        print(f"⚠️ ms_deform_attn patch failed: {e}", flush=True)
+
+_patch_ms_deform_attn()
+
+# ============================================================
+# 6. CONFIG
 # ============================================================
 
 SB_URL      = os.environ.get("SB_URL")
@@ -77,13 +165,13 @@ JOB_ID      = os.environ.get("JOB_ID")
 SESSION_ID  = os.environ.get("SESSION_ID")
 TEXT_PROMPT = os.environ.get("TEXT_PROMPT", "").strip()
 
-SAM_CHECKPOINT = "sam2_hiera_large.pt"
-SAM_CONFIG     = "sam2_hiera_l.yaml"
+SAM_CHECKPOINT  = "sam2_hiera_large.pt"
+SAM_CONFIG      = "sam2_hiera_l.yaml"
 DINO_CHECKPOINT = "groundingdino_swint_ogc.pth"
 DINO_CONFIG     = "GroundingDINO_SwinT_OGC.py"
 
 # ============================================================
-# 4. DOWNLOAD WEIGHTS
+# 7. DOWNLOAD WEIGHTS
 # ============================================================
 
 if not os.path.exists(SAM_CHECKPOINT):
@@ -96,13 +184,13 @@ if TEXT_PROMPT and not os.path.exists(DINO_CHECKPOINT):
     os.system("wget -q https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py")
 
 # ============================================================
-# 5. INIT SUPABASE
+# 8. INIT SUPABASE
 # ============================================================
 
 supabase = create_client(SB_URL, SB_KEY)
 
 # ============================================================
-# 6. HELPERS
+# 9. HELPERS
 # ============================================================
 
 def update_status(status, progress=0, logs=""):
@@ -129,7 +217,7 @@ def mask_to_polygon(mask):
     return approx.flatten().tolist()
 
 # ============================================================
-# 7. LOAD MODELS
+# 10. LOAD MODELS
 # ============================================================
 
 print("📦 Loading SAM2...", flush=True)
@@ -143,16 +231,16 @@ dino_model = None
 if TEXT_PROMPT:
     print(f"📦 Loading GroundingDINO for: '{TEXT_PROMPT}'", flush=True)
     try:
-        dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT, device=device)
-        dino_model.to(device)
+        dino_model = load_model(DINO_CONFIG, DINO_CHECKPOINT)
+        dino_model = dino_model.to(device)
         dino_model.eval()
-        print("✅ GroundingDINO loaded!", flush=True)
+        print("✅ GroundingDINO loaded on GPU!", flush=True)
     except Exception as e:
         print(f"⚠️ DINO load failed, falling back to YOLO: {e}", flush=True)
         dino_model = None
 
 # ============================================================
-# 8. MAIN PROCESS
+# 11. MAIN PROCESS
 # ============================================================
 
 try:
@@ -179,7 +267,6 @@ try:
         image_np = np.array(pil_img)
 
         sam_predictor.set_image(image_np)
-
         found_boxes = []
 
         # ------------------------------------------------
@@ -203,14 +290,20 @@ try:
                     caption=TEXT_PROMPT,
                     box_threshold=0.35,
                     text_threshold=0.25,
-                    device=device
+                    device=str(device)  # ✅ "cuda" or "cpu" as string
                 )
 
             h, w = image_np.shape[:2]
             for box, label in zip(boxes, phrases):
-                box = box * torch.tensor([w, h, w, h], dtype=torch.float32).to(device)
+                # DINO outputs normalized cx,cy,w,h → convert to pixel xyxy
                 cx, cy, bw, bh = box.tolist()
-                found_boxes.append((label, [cx - bw/2, cy - bh/2, cx + bw/2, cy + bh/2]))
+                x1 = (cx - bw / 2) * w
+                y1 = (cy - bh / 2) * h
+                x2 = (cx + bw / 2) * w
+                y2 = (cy + bh / 2) * h
+                if x2 - x1 < 10 or y2 - y1 < 10:
+                    continue
+                found_boxes.append((label, [x1, y1, x2, y2]))
 
             print(f"     DINO found {len(found_boxes)} objects", flush=True)
 
@@ -228,7 +321,7 @@ try:
 
         new_annotations = []
 
-        for label, xyxy in found_boxes:
+        for j, (label, xyxy) in enumerate(found_boxes):
             try:
                 masks, _, _ = sam_predictor.predict(
                     box=np.array(xyxy),
@@ -239,7 +332,7 @@ try:
                     continue
 
                 new_annotations.append({
-                    "id": f"seek_{time.time_ns()}_{i}_{label}",
+                    "id": f"seek_{time.time_ns()}_{i}_{j}_{label}",
                     "label": label,
                     "type": "polygon",
                     "points": poly,
