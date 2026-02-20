@@ -24,7 +24,8 @@ if device.type == "cuda":
 # ============================================================
 # 2. INSTALL DEPENDENCIES
 # ============================================================
-
+print("📌 Pinning transformers to 4.38.2 for DINO compatibility...", flush=True)
+os.system("pip install -q transformers==4.38.2")
 try:
     if os.path.exists("/content/GroundingDINO"):
         sys.path.insert(0, "/content/GroundingDINO")
